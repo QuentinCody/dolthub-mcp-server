@@ -1,10 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { dolthubQuery } from "../lib/http";
+import { dolthubQuery, dolthubListRepos, dolthubRepoDetail, dolthubTableSchemas } from "../lib/http";
 import {
     createCodeModeResponse,
     createCodeModeError,
 } from "@bio-mcp/shared/codemode/response";
+import { searchDatabases } from "../spec/database-index";
 
 export function registerDiscover(server: McpServer): void {
     server.registerTool(
@@ -12,94 +13,99 @@ export function registerDiscover(server: McpServer): void {
         {
             title: "Discover DoltHub Databases",
             description:
-                "Explore DoltHub repositories and their schemas. Use this to find databases, list tables, " +
-                "describe columns, and preview data before writing queries with dolthub_execute.\n\n" +
+                "Explore DoltHub repositories and their schemas.\n\n" +
                 "Actions:\n" +
-                "- tables: List all tables in a database (SHOW TABLES)\n" +
-                "- describe: Show column names and types for a table (DESCRIBE)\n" +
+                "- search: Find databases by keyword from curated index (e.g. 'hospital pricing', 'housing', 'finance')\n" +
+                "- repos: List/search repositories for an owner via live API. Use query param to filter.\n" +
+                "- detail: Get repository metadata (size, stars, forks, description)\n" +
+                "- tables: List all tables with full column schemas for a database\n" +
                 "- sample: Preview first 5 rows of a table\n" +
                 "- stats: Show row counts for all tables in a database",
             inputSchema: {
-                action: z.enum(["tables", "describe", "sample", "stats"]).describe(
-                    "What to discover: 'tables' lists all tables, 'describe' shows column schema, " +
-                    "'sample' previews rows, 'stats' shows row counts",
+                action: z.enum(["search", "repos", "detail", "tables", "sample", "stats"]).describe(
+                    "What to discover: 'search' finds databases by keyword, 'repos' lists/searches repos for an owner, " +
+                    "'detail' gets repo metadata, 'tables' shows full schemas, 'sample' previews rows, 'stats' shows row counts",
                 ),
-                database: z.string().min(1).describe(
+                query: z.string().optional().describe(
+                    "Search keyword — used by 'search' (curated index) and 'repos' (live API filter)",
+                ),
+                owner: z.string().optional().describe(
+                    "DoltHub owner — required for 'repos', optional for 'detail'/'tables'/'sample'/'stats' (parsed from database param)",
+                ),
+                database: z.string().optional().describe(
                     "Database in owner/name format (e.g. 'dolthub/hospital-price-transparency-v3')",
                 ),
                 table: z.string().optional().describe(
-                    "Table name — required for 'describe' and 'sample' actions",
+                    "Table name — required for 'sample' action",
                 ),
             },
         },
         async (args) => {
             try {
-                const dbParts = String(args.database).split("/");
-                if (dbParts.length < 2) {
-                    return createCodeModeError(
-                        "INVALID_ARGUMENTS",
-                        "database must be in owner/name format (e.g. 'dolthub/hospital-price-transparency-v3')",
-                    );
-                }
-                const owner = dbParts[0];
-                const dbName = dbParts.slice(1).join("/");
-                const table = args.table ? String(args.table) : undefined;
-
                 switch (args.action) {
-                    case "tables": {
-                        const result = await dolthubQuery(owner, dbName, "SHOW TABLES");
-                        const tables = result.rows.map((r) => Object.values(r)[0]);
+                    case "search": {
+                        const results = searchDatabases(args.query ? String(args.query) : "");
                         return createCodeModeResponse(
-                            { database: args.database, tables, table_count: tables.length },
+                            { query: args.query ?? "", results, count: results.length },
+                            { meta: { action: "search" } },
+                        );
+                    }
+
+                    case "repos": {
+                        const owner = args.owner ? String(args.owner) : "dolthub";
+                        const query = args.query ? String(args.query) : undefined;
+                        const repos = await dolthubListRepos(owner, query);
+                        return createCodeModeResponse(
+                            { owner, query, repositories: repos, count: repos.length },
+                            { meta: { action: "repos" } },
+                        );
+                    }
+
+                    case "detail": {
+                        const { owner, dbName } = parseDatabase(args);
+                        const detail = await dolthubRepoDetail(owner, dbName);
+                        if (!detail) {
+                            return createCodeModeError("NOT_FOUND", `Repository ${owner}/${dbName} not found`);
+                        }
+                        return createCodeModeResponse(detail, { meta: { action: "detail" } });
+                    }
+
+                    case "tables": {
+                        const { owner, dbName, database } = parseDatabase(args);
+                        const schemas = await dolthubTableSchemas(owner, dbName);
+                        return createCodeModeResponse(
+                            { database, tables: schemas, table_count: schemas.length },
                             { meta: { action: "tables" } },
                         );
                     }
 
-                    case "describe": {
-                        if (!table) {
-                            return createCodeModeError("MISSING_REQUIRED_PARAM", "table is required for 'describe' action");
-                        }
-                        const result = await dolthubQuery(owner, dbName, `DESCRIBE \`${table}\``);
-                        return createCodeModeResponse(
-                            { database: args.database, table, columns: result.rows },
-                            { meta: { action: "describe" } },
-                        );
-                    }
-
                     case "sample": {
+                        const { owner, dbName, database } = parseDatabase(args);
+                        const table = args.table ? String(args.table) : undefined;
                         if (!table) {
-                            return createCodeModeError("MISSING_REQUIRED_PARAM", "table is required for 'sample' action");
+                            return createCodeModeError("MISSING_REQUIRED_PARAM", "table is required for 'sample'");
                         }
                         const result = await dolthubQuery(owner, dbName, `SELECT * FROM \`${table}\` LIMIT 5`);
                         return createCodeModeResponse(
-                            {
-                                database: args.database,
-                                table,
-                                schema: result.schema,
-                                rows: result.rows,
-                                row_count: result.rows.length,
-                            },
+                            { database, table, schema: result.schema, rows: result.rows, row_count: result.rows.length },
                             { meta: { action: "sample" } },
                         );
                     }
 
                     case "stats": {
-                        const tablesResult = await dolthubQuery(owner, dbName, "SHOW TABLES");
-                        const tableNames = tablesResult.rows.map((r) => String(Object.values(r)[0]));
-                        const stats: Array<{ table: string; rows: number }> = [];
-                        for (const t of tableNames) {
+                        const { owner, dbName, database } = parseDatabase(args);
+                        const schemas = await dolthubTableSchemas(owner, dbName);
+                        const stats: Array<{ table: string; rows: number; columns: number }> = [];
+                        for (const t of schemas) {
                             try {
-                                const countResult = await dolthubQuery(
-                                    owner, dbName,
-                                    `SELECT COUNT(*) AS cnt FROM \`${t}\``,
-                                );
-                                stats.push({ table: t, rows: Number(countResult.rows[0]?.cnt ?? 0) });
+                                const countResult = await dolthubQuery(owner, dbName, `SELECT COUNT(*) AS cnt FROM \`${t.table}\``);
+                                stats.push({ table: t.table, rows: Number(countResult.rows[0]?.cnt ?? 0), columns: t.columns.length });
                             } catch {
-                                stats.push({ table: t, rows: -1 });
+                                stats.push({ table: t.table, rows: -1, columns: t.columns.length });
                             }
                         }
                         return createCodeModeResponse(
-                            { database: args.database, tables: stats },
+                            { database, tables: stats },
                             { meta: { action: "stats" } },
                         );
                     }
@@ -110,4 +116,13 @@ export function registerDiscover(server: McpServer): void {
             }
         },
     );
+}
+
+function parseDatabase(args: Record<string, unknown>): { owner: string; dbName: string; database: string } {
+    const database = args.database ? String(args.database) : "";
+    const parts = database.split("/");
+    if (parts.length < 2) {
+        throw new Error("database must be in owner/name format (e.g. 'dolthub/hospital-price-transparency-v3')");
+    }
+    return { owner: parts[0], dbName: parts.slice(1).join("/"), database };
 }
