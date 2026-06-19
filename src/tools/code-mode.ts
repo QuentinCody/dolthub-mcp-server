@@ -23,6 +23,8 @@ export function registerCodeMode(
 
     const executeTool = createExecuteTool({
         prefix: "dolthub",
+        // Verifiable provenance: dolthub_execute results carry a _meta.citation.
+        source: { id: "dolthub", name: "DoltHub", url: "https://www.dolthub.com" },
         catalog: dolthubCatalog,
         apiFetch,
         doNamespace: env.DOLTHUB_DATA_DO,
