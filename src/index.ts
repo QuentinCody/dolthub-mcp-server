@@ -1,17 +1,17 @@
 import { buildHealthResponse, configureCitationSigning } from "@bio-mcp/shared";
-import { StatelessMcpWorker } from "@bio-mcp/shared/mcp";
-import { McpServer } from "@bio-mcp/shared/mcp";
-import { registerDiscover } from "./tools/discover";
-import { registerQueryData } from "./tools/query-data";
-import { registerGetSchema } from "./tools/get-schema";
-import { registerCodeMode } from "./tools/code-mode";
+import { McpServer, StatelessMcpWorker } from "@bio-mcp/shared/mcp";
 import { DoltHubDataDO } from "./do";
+import { registerCodeMode } from "./tools/code-mode";
+import { registerDiscover } from "./tools/discover";
+import { registerGetSchema } from "./tools/get-schema";
+import { registerQueryData } from "./tools/query-data";
 
 export { DoltHubDataDO };
 
 interface DoltHubEnv {
     DOLTHUB_DATA_DO: DurableObjectNamespace;
     CODE_MODE_LOADER: WorkerLoader;
+    DOLTHUB_TOKEN?: string;
 }
 
 export class MyMCP extends StatelessMcpWorker {
@@ -24,7 +24,7 @@ export class MyMCP extends StatelessMcpWorker {
 
     	configureCitationSigning(this.env);
         const env = this.env as unknown as DoltHubEnv;
-        registerDiscover(this.server);
+        registerDiscover(this.server, env);
         registerQueryData(this.server, env);
         registerGetSchema(this.server, env);
         registerCodeMode(this.server, env);

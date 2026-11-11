@@ -1,3 +1,5 @@
+import { fail, readDoltResponse } from "./read-response";
+
 const DOLTHUB_API_BASE = "https://www.dolthub.com/api/v1alpha1";
 const DOLTHUB_GRAPHQL = "https://www.dolthub.com/graphql";
 
@@ -12,21 +14,26 @@ export async function dolthubQuery(
     ref?: string,
 ): Promise<DoltHubQueryResponse> {
     const path = ref
-        ? `${DOLTHUB_API_BASE}/${owner}/${database}/${ref}`
-        : `${DOLTHUB_API_BASE}/${owner}/${database}`;
+        ? `${DOLTHUB_API_BASE}/${encodeURIComponent(owner)}/${encodeURIComponent(database)}/${encodeURIComponent(ref)}`
+        : `${DOLTHUB_API_BASE}/${encodeURIComponent(owner)}/${encodeURIComponent(database)}`;
 
     const url = `${path}?q=${encodeURIComponent(sql)}`;
 
     const response = await fetch(url, {
         headers: { "User-Agent": "dolthub-mcp-server/1.0 (bio-mcp)" },
+        redirect: "manual", signal: AbortSignal.timeout(70000),
     });
 
+    const raw = await readDoltResponse(response);
+    let result: DoltHubQueryResponse;
+    try { result = JSON.parse(raw); }
+    catch { fail("DoltHub returned invalid JSON", 502, {response: raw, http_status: response.status}); }
     if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        throw new Error(`DoltHub API error: HTTP ${response.status} ${body.slice(0, 300)}`);
+        fail(`DoltHub API error: HTTP ${response.status}`, response.status, {response: raw, provider: result, http_status: response.status});
     }
-
-    return response.json() as Promise<DoltHubQueryResponse>;
+    if (!result || !["Success", "RowLimit", "Error"].includes(result.query_execution_status) || !Array.isArray(result.rows) || !Array.isArray(result.schema)) fail("Invalid DoltHub legacy query envelope", 502, {response: raw});
+    if (result.query_execution_status === "Error") fail("DoltHub SQL query failed", response.status, result);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,15 +54,19 @@ async function gql<T = unknown>(query: string, variables?: Record<string, unknow
             "User-Agent": "dolthub-mcp-server/1.0 (bio-mcp)",
         },
         body: JSON.stringify({ query, variables }),
+        redirect: "manual", signal: AbortSignal.timeout(70000),
     });
 
+    const raw = await readDoltResponse(response);
     if (!response.ok) {
-        throw new Error(`DoltHub GraphQL HTTP ${response.status}`);
+        fail(`DoltHub GraphQL HTTP ${response.status}`, response.status, {response: raw});
     }
 
-    const result = await response.json() as { data?: T; errors?: Array<{ message: string }> };
+    let result: { data?: T; errors?: Array<{ message: string }> };
+    try { result = JSON.parse(raw); }
+    catch { fail("Invalid DoltHub GraphQL JSON", 502, {response: raw}); }
     if (result.errors?.length) {
-        throw new Error(`DoltHub GraphQL: ${result.errors[0].message}`);
+        fail("DoltHub GraphQL query failed", response.status, result);
     }
     if (!result.data) {
         throw new Error("DoltHub GraphQL: empty response");
@@ -72,7 +83,6 @@ export async function dolthubListRepos(
     owner: string,
     search?: string,
 ): Promise<DoltHubRepo[]> {
-    try {
         const queryParam = search ? `, query: ${JSON.stringify(search)}` : "";
         const data = await gql<{
             repos: { list: Array<{ ownerName: string; repoName: string; description?: string }> };
@@ -82,10 +92,6 @@ export async function dolthubListRepos(
             name: r.repoName,
             description: r.description ?? "",
         }));
-    } catch {
-        // GraphQL failed — no fallback for repo listing
-        return [];
-    }
 }
 
 /**
@@ -130,7 +136,7 @@ export async function dolthubRepoDetail(
 export async function dolthubTableSchemas(
     owner: string,
     database: string,
-    ref = "main",
+    ref?: string,
 ): Promise<DoltHubTableSchema[]> {
     try {
         const data = await gql<{
@@ -138,7 +144,7 @@ export async function dolthubTableSchemas(
                 tableName: string;
                 columns: Array<{ name: string; type: string; isPrimaryKey: boolean; constraints: Array<{ notNull: boolean }> }>;
             }>;
-        }>(`query { tables(ownerName: ${JSON.stringify(owner)}, repoName: ${JSON.stringify(database)}, refName: ${JSON.stringify(ref)}) { tableName columns { name type isPrimaryKey constraints { notNull } } } }`);
+        }>(`query { tables(ownerName: ${JSON.stringify(owner)}, repoName: ${JSON.stringify(database)}, refName: ${JSON.stringify(ref ?? "main")}) { tableName columns { name type isPrimaryKey constraints { notNull } } } }`);
         return (data.tables ?? []).map((t) => ({
             table: t.tableName,
             columns: (t.columns ?? []).map((c) => ({
@@ -150,20 +156,21 @@ export async function dolthubTableSchemas(
         }));
     } catch {
         // Fallback to REST SQL API
-        return dolthubTableSchemasFallback(owner, database);
+        return dolthubTableSchemasFallback(owner, database, ref);
     }
 }
 
 async function dolthubTableSchemasFallback(
     owner: string,
     database: string,
+    ref?: string,
 ): Promise<DoltHubTableSchema[]> {
-    const tablesResult = await dolthubQuery(owner, database, "SHOW TABLES");
+    const tablesResult = await dolthubQuery(owner, database, "SHOW TABLES", ref);
     const tableNames = tablesResult.rows.map((r) => String(Object.values(r)[0]));
     const schemas: DoltHubTableSchema[] = [];
     for (const t of tableNames) {
         try {
-            const desc = await dolthubQuery(owner, database, `DESCRIBE \`${t}\``);
+            const desc = await dolthubQuery(owner, database, `DESCRIBE ${quoteIdentifier(t)}`, ref);
             schemas.push({
                 table: t,
                 columns: desc.rows.map((r) => ({
@@ -173,11 +180,24 @@ async function dolthubTableSchemasFallback(
                     notNull: r.Null === "NO",
                 })),
             });
-        } catch {
-            schemas.push({ table: t, columns: [] });
+        } catch (err) {
+            // A real table always has columns: keep the failure, never report it as an empty schema.
+            schemas.push({ table: t, columns: [], error: upstreamErrorSummary(err) });
         }
     }
     return schemas;
+}
+
+/** Compact, serialisable description of a caught upstream failure. */
+export function upstreamErrorSummary(err: unknown): { message: string; status?: number } {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = err && typeof err === "object" && "status" in err && typeof err.status === "number" ? err.status : undefined;
+    return { message: message.slice(0, 500), ...(status !== undefined ? { status } : {}) };
+}
+
+export function quoteIdentifier(value: string): string {
+    if (!value || value.length > 1000 || /[\0\r\n]/.test(value)) fail("Invalid table name");
+    return `\`${value.replaceAll("`", "``")}\``;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,4 +236,6 @@ export interface DoltHubTableSchema {
         primaryKey: boolean;
         notNull: boolean;
     }>;
+    /** Set when the column schema could not be read; `columns` is then empty and not authoritative. */
+    error?: { message: string; status?: number };
 }
