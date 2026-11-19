@@ -211,6 +211,10 @@ describe("only the default branch whose license was read", () => {
     ["AS OF a commit", "SELECT * FROM t AS OF 'k1v9e3s0b5q6m2lq8dfr7ftaht3a8sb2'"],
     ["as of in lower case over a line break", "select * from t as\n  of HASHOF('main~1')"],
     ["AS OF split by a comment", "SELECT * FROM t AS/**/OF 'main~1'"],
+    // Dolt runs the text of a MySQL executable comment: DoltHub answered this form with
+    // "branch not found: nosuchbranchxyz" for an unknown ref (2026-11-14).
+    ["OF inside a MySQL executable comment", "SELECT * FROM t AS /*!OF*/ 'main~1'"],
+    ["OF inside a versioned executable comment", "SELECT * FROM t AS /*!80000 OF */ 'main~1'"],
     ["the dolt_diff table function", "SELECT * FROM DOLT_DIFF('main~1', 'main', 't')"],
     ["a dolt_diff_<table> system table", "SELECT * FROM dolt_diff_t"],
     ["a dolt_history_<table> system table", "SELECT * FROM dolt_history_t"],

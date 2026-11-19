@@ -274,7 +274,9 @@ const REVISION_SQL: ReadonlyArray<readonly [RegExp, string]> = [
 /** The revision form that `sql` uses, or undefined when it reads only the branch of the request. */
 export function sqlRevisionReason(sql: string): string | undefined {
   const withoutComments = sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(?:--|#)[^\n]*/g, " ");
-  for (const text of [sql, withoutComments]) {
+  // Dolt runs the text of a MySQL executable comment (`AS /*!OF*/ 'x'` is AS OF): read comment text as SQL too.
+  const commentText = sql.replace(/\/\*!?\d*|\*\//g, " ");
+  for (const text of [sql, withoutComments, commentText]) {
     const hit = REVISION_SQL.find(([pattern]) => pattern.test(text));
     if (hit) return hit[1];
   }
